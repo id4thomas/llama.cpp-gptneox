@@ -1,5 +1,122 @@
-# llama.cpp
+# llama.cpp Edits for gpt-neo-x support
+## 1. Code Changes
+## 1-1. Makefile - add gpt-neox to target
+* Use examples/gptneox-wip/gptneox-main.cpp
+```
+BUILD_TARGETS = main gptneox ...
+...
+gptneox: examples/gptneox-wip/gptneox-main.cpp build-info.h ggml.o llama.o common.o console.o grammar-parser.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+	@echo
+	@echo '====  Run ./gptneox -h for help.  ===='
+	@echo
+...
+```
 
+## 1-2. Compile Errors
+### duplicate symbol '__Z16gpt_params_parseiPPcR10gpt_params'
+* examples/gptneox-wip/gptneox-main.cpp
+  * comment "gpt_params" from 
+  * add common.h header to 
+* common/common.h
+  * add interactive_port, token_test to "gpt_params"
+```
+<!-- common.h -->
+struct gpt_params {
+  ...
+    int32_t interactive_port = -1;
+    std::string token_test = "";
+};
+```
+### duplicate symbol '__Z15gpt_print_usageiPPcRK10gpt_params' '__Z16gpt_params_parseiPPcR10gpt_params'
+* examples/gptneox-wip/gptneox-main.cpp
+  * comment out "gpt_print_usage", "gpt_params_parse" -> use common version
+
+### error: no matching function for call to 'min'
+```
+examples/gptneox-wip/gptneox-main.cpp:985:24: error: no matching function for call to 'min'
+    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
+```
+* Due to n_predict being "int32_t", "n_ctx" being "uint32_t"
+  * https://stackoverflow.com/questions/14508022/error-no-matching-function-for-call-to-minlong-unsigned-int-unsigned-int
+* examples/gptneox-wip/gptneox-main.cpp
+  * change n_ctx in "gpt_neox_hparams" to "int32_t"
+
+## 1-3. 'error loading model: cannot find tokenizer scores in model file' when converting to gguf
+* add tokenizer score adding part in convert-gptneox-hf-to-gguf.py
+  * Add modified BpeVocab class from convert.py
+
+```
+vocab = BpeVocab(dir_model / 'tokenizer.json', None)
+# add scores
+tokens = []
+scores = []
+toktypes = []
+# NOTE: `all_tokens` returns the base vocabulary and added tokens
+for text, score, toktype in vocab.all_tokens():
+    tokens.append(text)
+    scores.append(score)
+    toktypes.append(toktype)
+
+gguf_writer.add_token_list(tokens)
+gguf_writer.add_token_scores(scores)
+gguf_writer.add_token_types(toktypes)
+```
+
+## 2. Usage
+### 2-1. Converting
+```
+# 0 for fp32, 1 for fp16
+python convert-gptneox-hf-to-gguf.py ${MODEL_DIR} 1 ...
+```
+### 2-2. Running
+* There are currently issues with whitespace
+  * ERROR: byte not found in vocab: ' '
+  * https://github.com/ggerganov/llama.cpp/issues/2865
+
+Example:
+```
+(llm) id4thomas@yrsong-NB3 llama.cpp-latest % ./gptneox -m /Users/id4thomas/mac_dl/llm_mac/convert_model/converted/polyglot-ko-1.3b/1b-f16.gguf -n 256
+gpt_neox_model_load: loading model from '/Users/id4thomas/mac_dl/llm_mac/convert_model/converted/polyglot-ko-1.3b/1b-f16.gguf'..
+gpt_neox_model_load: gguf version     = 2
+gpt_neox_model_load: gguf alignment   = 32
+gpt_neox_model_load: gguf data offset = 2036864
+gpt_neox_model_load: model name           = polyglot-ko-1.3b
+gpt_neox_model_load: model architecture   = gptneox
+gpt_neox_model_load: n_ctx    = 2048
+gpt_neox_model_load: n_embd   = 2048
+gpt_neox_model_load: n_head   = 16
+gpt_neox_model_load: n_block  = 24
+gpt_neox_model_load: n_rot    = 64
+gpt_neox_model_load: par_res  = 1
+gpt_neox_model_load: norm_eps = 1e-05
+gpt_neox_model_load: gpt2 tokenizer vocab  = 30000
+gpt_neox_model_load: gpt2 tokenizer merges = 29740
+gpt_neox_model_load: EOS token = 2 '<|endoftext|>'
+gpt_neox_model_load: PAD token = 2 '<|endoftext|>'
+gpt_neox_model_load: LF token  = 202
+gpt_neox_model_load: ggml ctx size = 2541.55 MB
+gpt_neox_model_load: memory_size =   384.00 MB, n_mem = 49152
+main: seed           = -1
+main: temp           = 0.800
+main: top_k          = 40
+main: top_p          = 0.950
+main: repeat_last_n  = 64
+main: repeat_penalty = 1.100
+main: number of tokens in prompt = 6
+main: n_predict = 256
+
+Once upon 공헌을 한). He always has a soft spot for lightning and will flirt with many of the top stars. 그는 항상 번개를 좋아하며, 가장 빠른 스타들 중 몇몇과 시시덕거립니다. He is not shy about big fish and pretty little fishes. 그는 커다란 물고기도 좋아하지 않고 작은 물고기도 좋아하지 않습니다. Kevin Love's nose was nothing to write home about. 케빈의 코는 집에 가져 가서 자랑할 것이 없었다. He would be a fine egg for maturity and good times. 그는 성숙한 모습과 좋은 시절을 가졌습니다. Keep the stranger down! You'll have to help her, then. 좀 비켜라! 너 그러면 안돼! 네가 도와줘야지. He broke into a tree like a king. 그는 왕
+
+main: mem per token =   252636 bytes
+main:     load time =  1623.10 ms
+main:   sample time =   234.38 ms
+main:  predict time =  8483.05 ms / 32.50 ms per token
+main:    total time = 11138.98 ms
+```
+
+
+# Original llama.cpp README
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![Actions Status](https://github.com/ggerganov/llama.cpp/workflows/CI/badge.svg)](https://github.com/ggerganov/llama.cpp/actions)

@@ -9,7 +9,7 @@ import os
 import struct
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -21,6 +21,75 @@ import gguf
 
 # ref: https://github.com/openai/gpt-2/blob/master/src/encoder.py
 
+## Taken from conver.py
+class BpeVocab:
+    def __init__(self, fname_tokenizer: Path, fname_added_tokens: Path | None) -> None:
+        self.bpe_tokenizer = json.loads(open(str(fname_tokenizer), encoding="utf-8").read())["model"]["vocab"]
+        added_tokens: dict[str, int]
+        if fname_added_tokens is not None:
+            # FIXME: Verify that added tokens here _cannot_ overlap with the main vocab.
+            added_tokens = json.load(open(fname_added_tokens, encoding="utf-8"))
+        else:
+            # Fall back to trying to find the added tokens in tokenizer.json
+            tokenizer_json_file = fname_tokenizer.parent / 'tokenizer.json'
+            if not tokenizer_json_file.is_file():
+                added_tokens = {}
+            else:
+                tokenizer_json = json.load(open(tokenizer_json_file, encoding="utf-8"))
+                added_tokens = dict(
+                    (item['content'], item['id'])
+                    for item in tokenizer_json.get('added_tokens', [])
+                    # Added tokens here can be duplicates of the main vocabulary.
+                    if item['content'] not in self.bpe_tokenizer )
+
+        vocab_size: int = len(self.bpe_tokenizer)
+        expected_ids    = list(range(vocab_size, vocab_size + len(added_tokens)))
+        actual_ids      = sorted(added_tokens.values())
+        if expected_ids != actual_ids:
+            expected_end_id = vocab_size + len(actual_ids) - 1
+            raise Exception(f"Expected the {len(actual_ids)} added token ID(s) to be sequential in the range {vocab_size} - {expected_end_id}; got {actual_ids}")
+
+        items = sorted(added_tokens.items(), key=lambda text_idx: text_idx[1])
+        self.added_tokens_list    = [text for (text, idx) in items]
+        self.vocab_size_base: int = vocab_size
+        self.vocab_size: int      = self.vocab_size_base + len(self.added_tokens_list)
+        self.fname_tokenizer      = fname_tokenizer
+        self.fname_added_tokens   = fname_added_tokens
+
+    def bpe_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
+        tokenizer = self.bpe_tokenizer
+        from transformers.models.gpt2 import tokenization_gpt2  # type: ignore[import]
+        # byte_encoder = tokenization_gpt2.bytes_to_unicode()
+        byte_encoder = bytes_to_unicode()
+        byte_decoder = {v: k for k, v in byte_encoder.items()}
+        score = 0.0
+        for i, item in enumerate(tokenizer):
+            text: bytes = item.encode("utf-8")
+            # FIXME: These shouldn't be hardcoded, but it's probably better than the current behavior?
+            if i <= 258 and text.startswith(b'<') and text.endswith(b'>'):
+                if i == 0 and text == b'<unk>':
+                    toktype = gguf.TokenType.UNKNOWN
+                elif i == 1 or i == 2:
+                    toktype = gguf.TokenType.CONTROL
+                elif i >= 3 and text.startswith(b'<0x'):
+                    toktype = gguf.TokenType.BYTE
+                else:
+                    toktype = gguf.TokenType.NORMAL
+            else:
+                toktype = gguf.TokenType.NORMAL
+            yield text, score, toktype
+
+    def added_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
+        for text in self.added_tokens_list:
+            score = -1000.0
+            yield text.encode("utf-8"), score, gguf.TokenType.USER_DEFINED
+
+    def all_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
+        yield from self.bpe_tokens()
+        yield from self.added_tokens()
+
+    def __repr__(self) -> str:
+        return f"<BpeVocab with {self.vocab_size_base} base tokens and {len(self.added_tokens_list)} added tokens>"
 
 def bytes_to_unicode():
     """
@@ -135,35 +204,49 @@ print("gguf: get gpt2 tokenizer vocab")
 vocab_size = len(tokenizer_json["model"]["vocab"])
 
 # ref: https://github.com/cmp-nct/ggllm.cpp/blob/master/falcon_convert.py
-tokenizer = AutoTokenizer.from_pretrained(dir_model)
+# tokenizer = AutoTokenizer.from_pretrained(dir_model)
 
-reverse_vocab = {id: encoded_tok for encoded_tok, id in tokenizer.vocab.items()}
-byte_encoder = bytes_to_unicode()
-byte_decoder = {v: k for k, v in byte_encoder.items()}
+# reverse_vocab = {id: encoded_tok for encoded_tok, id in tokenizer.vocab.items()}
+# byte_encoder = bytes_to_unicode()
+# byte_decoder = {v: k for k, v in byte_encoder.items()}
 
-for i in range(vocab_size):
-    if i in reverse_vocab:
-        try:
-            text = bytearray([byte_decoder[c] for c in reverse_vocab[i]])
-        except KeyError:
-            text = bytearray()
-            for c in reverse_vocab[i]:
-                if ord(c) < 256:  # single byte character
-                    text.append(byte_decoder[ord(c)])
-                else:  # multibyte special token character
-                    text.extend(c.encode('utf-8'))
-    else:
-        print(f"Key {i} not in tokenizer vocabulary. Padding with an arbitrary token.")
-        pad_token = f"[PAD{i}]".encode("utf8")
-        text = bytearray(pad_token)
+# for i in range(vocab_size):
+#     if i in reverse_vocab:
+#         try:
+#             text = bytearray([byte_decoder[c] for c in reverse_vocab[i]])
+#         except KeyError:
+#             text = bytearray()
+#             for c in reverse_vocab[i]:
+#                 if ord(c) < 256:  # single byte character
+#                     text.append(byte_decoder[ord(c)])
+#                 else:  # multibyte special token character
+#                     text.extend(c.encode('utf-8'))
+#     else:
+#         print(f"Key {i} not in tokenizer vocabulary. Padding with an arbitrary token.")
+#         pad_token = f"[PAD{i}]".encode("utf8")
+#         text = bytearray(pad_token)
 
+#     tokens.append(text)
+
+# gguf_writer.add_token_list(tokens)
+
+added_tokens_path = dir_model / 'added_tokens.json'
+vocab = BpeVocab(dir_model / 'tokenizer.json', added_tokens_path if added_tokens_path.exists() else None)
+# add scores
+tokens = []
+scores = []
+toktypes = []
+# NOTE: `all_tokens` returns the base vocabulary and added tokens
+for text, score, toktype in vocab.all_tokens():
     tokens.append(text)
+    scores.append(score)
+    toktypes.append(toktype)
 
 gguf_writer.add_token_list(tokens)
-
+gguf_writer.add_token_scores(scores)
+gguf_writer.add_token_types(toktypes)
 special_vocab = gguf.SpecialVocab(dir_model, load_merges = True)
 special_vocab.add_to_gguf(gguf_writer)
-
 # TENSORS
 
 tensor_map = gguf.get_tensor_name_map(ARCH,block_count)
